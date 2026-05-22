@@ -45,10 +45,22 @@ struct page *my_tmpfs_alloc_page(struct my_tmpfs_file *mf, int index)
 /* 释放所有已分配的页，然后释放文件对象本身。 */
 void my_tmpfs_free_file(struct my_tmpfs_file *mf)
 {
+    struct my_tmpfs_dir_entry *entry;
+    struct my_tmpfs_dir_entry *tmp;
     int i;
 
     if (!mf)
         return;
+
+    if (!mf->is_dir && !mf->pages && !mf->symlink_target) {
+        MY_TMPFS_LOG("free_file already freed size=%lld", (long long)mf->size);
+        kfree(mf);
+        return;
+    }
+
+    MY_TMPFS_LOG("free_file is_dir=%d size=%lld pages=%d children=%s", mf->is_dir,
+                 (long long)mf->size, mf->nr_pages,
+                 mf->is_dir ? "yes" : "no");
 
     if (mf->pages) {
         for (i = 0; i < mf->max_pages; i++) {
@@ -56,6 +68,17 @@ void my_tmpfs_free_file(struct my_tmpfs_file *mf)
                 __free_page(mf->pages[i]);
         }
         kfree(mf->pages);
+    }
+
+    if (mf->symlink_target)
+        kfree(mf->symlink_target);
+
+    if (mf->is_dir) {
+        list_for_each_entry_safe(entry, tmp, &mf->children, list) {
+            list_del(&entry->list);
+            kfree(entry->name);
+            kfree(entry);
+        }
     }
 
     kfree(mf);

@@ -17,6 +17,14 @@
 #include <linux/uaccess.h>
 #include <linux/fcntl.h>
 
+#define MY_TMPFS_DEBUG 1
+
+#if MY_TMPFS_DEBUG
+#define MY_TMPFS_LOG(fmt, ...) pr_info("my_tmpfs: %s: " fmt "\n", __func__, ##__VA_ARGS__)
+#else
+#define MY_TMPFS_LOG(fmt, ...) do { } while (0)
+#endif
+
 #define MY_TMPFS_MAGIC            0x12345678
 #define MY_TMPFS_DEFAULT_MAX_SIZE (16UL * 1024 * 1024)
 #define MY_TMPFS_DEFAULT_MAX_INODES 1000
@@ -35,16 +43,27 @@ struct my_tmpfs_file {
     struct page **pages;
     int nr_pages;
     int max_pages;
+    char *symlink_target;
+    struct list_head children;
+    bool is_dir;
+};
+
+struct my_tmpfs_dir_entry {
+    struct list_head list;
+    char *name;
+    struct inode *inode;
 };
 
 struct page *my_tmpfs_alloc_page(struct my_tmpfs_file *mf, int index);
 void my_tmpfs_free_file(struct my_tmpfs_file *mf);
+int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize);
 
 struct inode *my_tmpfs_get_inode(struct super_block *sb, umode_t mode);
 void my_tmpfs_free_inode(struct inode *inode);
 
 extern const struct inode_operations my_tmpfs_dir_inode_ops;
 extern const struct inode_operations my_tmpfs_file_inode_ops;
+extern const struct inode_operations my_tmpfs_symlink_inode_ops;
 extern const struct file_operations my_tmpfs_file_ops;
 extern const struct super_operations my_tmpfs_sops;
 

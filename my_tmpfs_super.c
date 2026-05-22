@@ -28,6 +28,7 @@ const struct super_operations my_tmpfs_sops = {
 int my_tmpfs_fill_super(struct super_block *sb, void *data, int silent)
 {
     struct inode *root_inode;
+    struct my_tmpfs_file *root_priv;
     struct my_tmpfs_sb_info *sbi;
 
     (void)data;
@@ -55,6 +56,18 @@ int my_tmpfs_fill_super(struct super_block *sb, void *data, int silent)
         kfree(sbi);
         return -ENOMEM;
     }
+
+    root_priv = kzalloc(sizeof(struct my_tmpfs_file), GFP_KERNEL);
+    if (!root_priv) {
+        iput(root_inode);
+        kfree(sbi);
+        return -ENOMEM;
+    }
+
+    root_priv->is_dir = true;
+    INIT_LIST_HEAD(&root_priv->children);
+    root_inode->i_private = root_priv;
+    set_nlink(root_inode, 2);
 
     sbi->current_inodes++;
     sb->s_root = d_make_root(root_inode);

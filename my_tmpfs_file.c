@@ -5,6 +5,11 @@ static ssize_t my_tmpfs_read(struct file *filp, char __user *buf,
                              size_t len, loff_t *off)
 {
     struct my_tmpfs_file *mf = filp->private_data;
+
+    MY_TMPFS_LOG("read: mf=%p, mf->pages=%p, mf->nr_pages=%d, mf->size=%lld",
+                 mf, mf ? mf->pages : NULL, mf ? mf->nr_pages : 0, 
+                 mf ? mf->size : 0);
+
     size_t pos;
     size_t avail;
     size_t ret = 0;
@@ -75,6 +80,9 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     if (!mf)
         return -EINVAL;
 
+    MY_TMPFS_LOG("write inode=%lu len=%zu off=%lld flags=0x%x size=%lld", inode->i_ino,
+                 len, (long long)*off, filp->f_flags, (long long)mf->size);
+
     if (filp->f_flags & O_APPEND) {
         pos = mf->size;
         *off = pos;
@@ -123,6 +131,95 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     return ret;
 }
 
+int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
+{
+    struct my_tmpfs_file *mf;
+    struct my_tmpfs_sb_info *sbi;
+    loff_t oldsize;
+    size_t old_tail;
+    size_t new_tail;
+    size_t start_page;
+    size_t i;
+    char *kaddr;
+    struct page *page;
+
+    if (!inode || !S_ISREG(inode->i_mode))
+        return -EINVAL;
+
+    if (newsize < 0 || newsize > inode->i_sb->s_maxbytes)
+        return -EINVAL;
+
+    MY_TMPFS_LOG("truncate inode=%lu old=%lld new=%lld", inode->i_ino,
+                 (long long)inode->i_size, (long long)newsize);
+
+    mf = inode->i_private;
+    if (!mf) {
+        mf = kzalloc(sizeof(*mf), GFP_KERNEL);
+        if (!mf)
+            return -ENOMEM;
+
+        mf->is_dir = false;
+        inode->i_private = mf;
+    }
+
+    sbi = inode->i_sb->s_fs_info;
+    oldsize = mf->size;
+    if (newsize == oldsize)
+        return 0;
+
+    if (newsize < oldsize) {
+        old_tail = oldsize & (PAGE_SIZE - 1);
+        new_tail = newsize & (PAGE_SIZE - 1);
+        start_page = (newsize + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+        if (mf->pages && new_tail && start_page > 0 && (start_page - 1) < (size_t)mf->max_pages) {
+            page = mf->pages[start_page - 1];
+            if (page) {
+                kaddr = kmap(page);
+                if (!kaddr)
+                    return -ENOMEM;
+                memset(kaddr + new_tail, 0, PAGE_SIZE - new_tail);
+                kunmap(page);
+            }
+        }
+
+        if (mf->pages) {
+            for (i = start_page; i < (size_t)mf->max_pages; i++) {
+                if (!mf->pages[i])
+                    continue;
+                __free_page(mf->pages[i]);
+                mf->pages[i] = NULL;
+                if (mf->nr_pages > 0)
+                    mf->nr_pages--;
+            }
+        }
+
+        if (sbi && sbi->current_size >= (unsigned long)(oldsize - newsize))
+            sbi->current_size -= (unsigned long)(oldsize - newsize);
+        else if (sbi)
+            sbi->current_size = 0;
+    } else {
+        old_tail = oldsize & (PAGE_SIZE - 1);
+        if (mf->pages && old_tail) {
+            page = mf->pages[oldsize >> PAGE_SHIFT];
+            if (page) {
+                kaddr = kmap(page);
+                if (!kaddr)
+                    return -ENOMEM;
+                memset(kaddr + old_tail, 0, min_t(size_t, PAGE_SIZE - old_tail,
+                                                   newsize - oldsize));
+                kunmap(page);
+            }
+        }
+    }
+
+    mf->size = newsize;
+    inode->i_size = newsize;
+    inode->i_mtime = inode->i_ctime = current_time(inode);
+
+    return 0;
+}
+
 /* 第一次打开文件时，懒分配 inode 对应的后端对象。 */
 static int my_tmpfs_open(struct inode *inode, struct file *filp)
 {
@@ -138,8 +235,11 @@ static int my_tmpfs_open(struct inode *inode, struct file *filp)
         mf->pages = NULL;
         mf->nr_pages = 0;
         mf->max_pages = 0;
+        mf->is_dir = false;
         inode->i_private = mf;
     }
+
+    MY_TMPFS_LOG("open inode=%lu size=%lld", inode->i_ino, (long long)inode->i_size);
 
     filp->private_data = mf;
     return 0;

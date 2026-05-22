@@ -19,6 +19,9 @@ struct inode *my_tmpfs_get_inode(struct super_block *sb, umode_t mode)
         inode->i_op = &my_tmpfs_file_inode_ops;
         inode->i_fop = &my_tmpfs_file_ops;
         inode->i_mapping->a_ops = &empty_aops;
+    } else if (S_ISLNK(mode)) {
+        inode->i_op = &my_tmpfs_symlink_inode_ops;
+        inode->i_mapping->a_ops = &empty_aops;
     } else if (S_ISDIR(mode)) {
         inode->i_op = &my_tmpfs_dir_inode_ops;
         inode->i_fop = &simple_dir_operations;
@@ -33,12 +36,16 @@ void my_tmpfs_free_inode(struct inode *inode)
 {
     struct my_tmpfs_file *mf;
 
-    if (!inode)
+    if (inode->i_nlink > 0) {
+        MY_TMPFS_LOG("free_inode: nlink=%d, skipping", inode->i_nlink);
         return;
+    }
 
     mf = inode->i_private;
     if (!mf)
         return;
+
+    MY_TMPFS_LOG("free_inode ino=%lu, freeing file private data", inode->i_ino);
 
     my_tmpfs_free_file(mf);
     inode->i_private = NULL;

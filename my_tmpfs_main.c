@@ -13,8 +13,8 @@ static struct dentry *my_tmpfs_mount(struct file_system_type *fs_type,
 /* 卸载时释放 superblock 私有的统计结构。 */
 static void my_tmpfs_kill_sb(struct super_block *sb)
 {
-    kfree(sb->s_fs_info);
     kill_litter_super(sb);
+    kfree(sb->s_fs_info);
 }
 
 static struct file_system_type my_tmpfs_fs_type = {
