@@ -13,6 +13,7 @@ static struct my_tmpfs_file *my_tmpfs_get_dir_private(struct inode *inode)
 
     mf->is_dir = true;
     INIT_LIST_HEAD(&mf->children);
+    xa_init(&mf->swap_entries);   // 新增
     inode->i_private = mf;
     return mf;
 }
@@ -29,6 +30,7 @@ static struct my_tmpfs_file *my_tmpfs_get_file_private(struct inode *inode)
         return NULL;
 
     mf->size = inode->i_size;
+    xa_init(&mf->swap_entries);   // 新增
     inode->i_private = mf;
     return mf;
 }

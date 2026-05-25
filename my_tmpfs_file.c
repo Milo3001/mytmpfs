@@ -1,28 +1,84 @@
 #include "my_tmpfs.h"
+#include <linux/swap.h>        // get_swap_page, swap_writepage, swap_readpage, put_swap_page
+#include <linux/swapops.h>     // add_to_swap_cache, delete_from_swap_cache
+#include <linux/writeback.h>   // writeback_control
+
+
+// 一个用于获取页面内容的辅助函数
+struct page *my_tmpfs_get_page(struct inode *inode, pgoff_t index)
+{
+    struct my_tmpfs_file *mf = inode->i_private;
+    struct page *page;
+    swp_entry_t swap = {0};
+    void *entry;
+    int error;
+
+    /* 1. 先查 page cache */
+    page = find_get_page(inode->i_mapping, index);
+    if (page)
+        return page;
+
+    /* 2. 检查是否已被换出 */
+    entry = xa_load(&mf->swap_entries, index);
+    if (entry)
+        swap.val = xa_to_value(entry);
+
+    if (swap.val) {
+        /* 分配一个新页并换入 */
+        page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+        if (!page)
+            return ERR_PTR(-ENOMEM);
+
+        /* 加入 swap cache */
+        if (add_to_swap_cache(page, swap, GFP_NOFS, NULL)) {
+            put_page(page);
+            return ERR_PTR(-ENOMEM);
+        }
+
+        /* 从 swap 读入 (同步读, 完成后页面被解锁) */
+        error = swap_readpage(page, false);
+        if (error) {
+            delete_from_swap_cache(page);
+            put_page(page);
+            return ERR_PTR(error);
+        }
+
+        /* 从 swap cache 移除，准备加入 page cache */
+        delete_from_swap_cache(page);
+
+        /* 将 page 添加到 page cache */
+        error = add_to_page_cache_lru(page, inode->i_mapping, index, GFP_NOFS);
+        if (error) {
+            put_page(page);
+            return ERR_PTR(error);
+        }
+
+        /* 释放 swap 槽位，清除映射 */
+        put_swap_page(page, swap);
+        xa_erase(&mf->swap_entries, index);
+
+        /* 页面已经是 uptodate 且 unlocked (swap_readpage 已解锁) */
+        SetPageUptodate(page);
+        return page;
+    }
+
+    /* 3. 空洞返回 ZERO_PAGE */
+    return ZERO_PAGE(0);
+}
 
 /* 从内存页数组读取，遇到稀疏空洞时返回 0。 */
 static ssize_t my_tmpfs_read(struct file *filp, char __user *buf,
                              size_t len, loff_t *off)
 {
-    struct my_tmpfs_file *mf = filp->private_data;
-
-    MY_TMPFS_LOG("read: mf=%p, mf->pages=%p, mf->nr_pages=%d, mf->size=%lld",
-                 mf, mf ? mf->pages : NULL, mf ? mf->nr_pages : 0, 
-                 mf ? mf->size : 0);
-
-    size_t pos;
+    struct inode *inode = file_inode(filp);
+    struct my_tmpfs_file *mf = inode->i_private;
+    size_t pos = *off;
     size_t avail;
     size_t ret = 0;
-    struct page *page;
-    char *kaddr;
-    size_t page_idx;
-    size_t page_off;
-    size_t copy_len;
 
     if (!mf)
         return -EINVAL;
 
-    pos = *off;
     if (pos >= mf->size)
         return 0;
 
@@ -31,24 +87,39 @@ static ssize_t my_tmpfs_read(struct file *filp, char __user *buf,
         len = avail;
 
     while (len > 0) {
-        page_idx = pos >> PAGE_SHIFT;
-        page_off = pos & (PAGE_SIZE - 1);
-        copy_len = min(len, PAGE_SIZE - page_off);
+        pgoff_t idx = pos >> PAGE_SHIFT;
+        size_t offset = pos & ~PAGE_MASK;
+        size_t copy_len = min(len, PAGE_SIZE - offset);
+        struct page *page;
+        char *kaddr;
 
-        if (!mf->pages || page_idx >= mf->max_pages || !mf->pages[page_idx]) {
-            if (clear_user(buf, copy_len))
-                return ret ? ret : -EFAULT;
+        page = my_tmpfs_get_page(inode, idx);
+        if (IS_ERR(page))
+            return PTR_ERR(page);
+
+        if (page == ZERO_PAGE(0)) {
+            if (clear_user(buf, copy_len)) {
+                if (ret == 0)
+                    ret = -EFAULT;
+                break;
+            }
         } else {
-            page = mf->pages[page_idx];
             kaddr = kmap(page);
-            if (!kaddr)
-                return ret ? ret : -ENOMEM;
-
-            if (copy_to_user(buf, kaddr + page_off, copy_len)) {
+            if (!kaddr) {
+                put_page(page);
+                if (ret == 0)
+                    ret = -ENOMEM;
+                break;
+            }
+            if (copy_to_user(buf, kaddr + offset, copy_len)) {
                 kunmap(page);
-                return ret ? ret : -EFAULT;
+                put_page(page);
+                if (ret == 0)
+                    ret = -EFAULT;
+                break;
             }
             kunmap(page);
+            put_page(page);
         }
 
         ret += copy_len;
@@ -198,6 +269,13 @@ int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
             sbi->current_size -= (unsigned long)(oldsize - newsize);
         else if (sbi)
             sbi->current_size = 0;
+        
+        for (i = start_page; i < ((oldsize + PAGE_SIZE - 1) >> PAGE_SHIFT); i++) {
+            // 清除 xarray 中的 swap entry
+            void *entry = xa_erase(&mf->swap_entries, i);
+            if (entry)
+                put_swap_page(NULL, (swp_entry_t){.val = xa_to_value(entry)});
+        }
     } else {
         old_tail = oldsize & (PAGE_SIZE - 1);
         if (mf->pages && old_tail) {
@@ -236,6 +314,7 @@ static int my_tmpfs_open(struct inode *inode, struct file *filp)
         mf->nr_pages = 0;
         mf->max_pages = 0;
         mf->is_dir = false;
+        xa_init(&mf->swap_entries);
         inode->i_private = mf;
     }
 
