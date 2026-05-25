@@ -11,3 +11,7 @@ all:
 # 删除生成的目标文件和已构建的模块。
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+cleanall: 
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm test_swap

@@ -33,8 +33,10 @@ struct page *my_tmpfs_get_page(struct inode *inode, pgoff_t index)
     if (!page)
         return ERR_PTR(-ENOMEM);
 
+    lock_page(page);
     kaddr = kmap(page);
     if (!kaddr) {
+        unlock_page(page);
         put_page(page);
         return ERR_PTR(-ENOMEM);
     }
@@ -42,6 +44,7 @@ struct page *my_tmpfs_get_page(struct inode *inode, pgoff_t index)
     backend_addr = kmap(backend_page);
     if (!backend_addr) {
         kunmap(page);
+        unlock_page(page);
         put_page(page);
         return ERR_PTR(-ENOMEM);
     }
@@ -53,10 +56,12 @@ struct page *my_tmpfs_get_page(struct inode *inode, pgoff_t index)
     SetPageUptodate(page);
     error = add_to_page_cache_lru(page, inode->i_mapping, index, GFP_NOFS);
     if (error) {
+        unlock_page(page);
         put_page(page);
         return ERR_PTR(error);
     }
 
+    unlock_page(page);
     return page;
 }
 
@@ -138,6 +143,7 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     size_t ret = 0;
     struct page *page;
     char *kaddr;
+    pgoff_t first_page;
     size_t page_idx;
     size_t page_off;
     size_t copy_len;
@@ -154,6 +160,9 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     } else {
         pos = *off;
     }
+
+    page_idx = pos >> PAGE_SHIFT;
+    first_page = page_idx;
 
     if (sbi->current_size + len > sbi->max_size)
         return -ENOSPC;
@@ -188,6 +197,8 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
             mf->size = pos;
         }
     }
+
+    invalidate_inode_pages2_range(inode->i_mapping, first_page, page_idx);
 
     *off = pos;
     inode->i_size = mf->size;
@@ -274,6 +285,10 @@ int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
             if (mf->nr_pages > 0)
                 mf->nr_pages--;
         }
+
+        invalidate_inode_pages2_range(inode->i_mapping,
+                                      newsize >> PAGE_SHIFT,
+                                      ((oldsize + PAGE_SIZE - 1) >> PAGE_SHIFT));
     } else {
         old_tail = oldsize & (PAGE_SIZE - 1);
         if (mf->pages && old_tail) {
@@ -285,6 +300,9 @@ int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
                 memset(kaddr + old_tail, 0, min_t(size_t, PAGE_SIZE - old_tail,
                                                    newsize - oldsize));
                 kunmap(page);
+                invalidate_inode_pages2_range(inode->i_mapping,
+                                              oldsize >> PAGE_SHIFT,
+                                              oldsize >> PAGE_SHIFT);
             }
         }
     }
