@@ -1,28 +1,83 @@
 #include "my_tmpfs.h"
+#include <linux/writeback.h>   // writeback_control
+
+
+// 一个用于获取页面内容的辅助函数
+struct page *my_tmpfs_get_page(struct inode *inode, pgoff_t index)
+{
+    struct my_tmpfs_file *mf = inode->i_private;
+    struct page *page;
+    struct page *backend_page;
+    void *kaddr;
+    void *backend_addr;
+    int error;
+
+    if (!mf)
+        return ERR_PTR(-EINVAL);
+
+    /* 1. 先查 page cache */
+    page = find_get_page(inode->i_mapping, index);
+    if (page)
+        return page;
+
+    /* 2. 如果后端页存在，从后端页复制到新 page 并加入 page cache */
+    if (index < mf->max_pages)
+        backend_page = mf->pages[index];
+    else
+        backend_page = NULL;
+
+    if (!backend_page)
+        return ZERO_PAGE(0);
+
+    page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+    if (!page)
+        return ERR_PTR(-ENOMEM);
+
+    lock_page(page);
+    kaddr = kmap(page);
+    if (!kaddr) {
+        unlock_page(page);
+        put_page(page);
+        return ERR_PTR(-ENOMEM);
+    }
+
+    backend_addr = kmap(backend_page);
+    if (!backend_addr) {
+        kunmap(page);
+        unlock_page(page);
+        put_page(page);
+        return ERR_PTR(-ENOMEM);
+    }
+
+    memcpy(kaddr, backend_addr, PAGE_SIZE);
+    kunmap(backend_page);
+    kunmap(page);
+
+    SetPageUptodate(page);
+    error = add_to_page_cache_lru(page, inode->i_mapping, index, GFP_NOFS);
+    if (error) {
+        unlock_page(page);
+        put_page(page);
+        return ERR_PTR(error);
+    }
+
+    unlock_page(page);
+    return page;
+}
 
 /* 从内存页数组读取，遇到稀疏空洞时返回 0。 */
 static ssize_t my_tmpfs_read(struct file *filp, char __user *buf,
                              size_t len, loff_t *off)
 {
-    struct my_tmpfs_file *mf = filp->private_data;
-
-    MY_TMPFS_LOG("read: mf=%p, mf->pages=%p, mf->nr_pages=%d, mf->size=%lld",
-                 mf, mf ? mf->pages : NULL, mf ? mf->nr_pages : 0, 
-                 mf ? mf->size : 0);
-
-    size_t pos;
+    struct inode *inode = file_inode(filp);
+    struct my_tmpfs_file *mf = inode->i_private;
+    size_t pos = *off;
     size_t avail;
     size_t ret = 0;
-    struct page *page;
-    char *kaddr;
-    size_t page_idx;
-    size_t page_off;
-    size_t copy_len;
 
     if (!mf)
         return -EINVAL;
 
-    pos = *off;
     if (pos >= mf->size)
         return 0;
 
@@ -31,24 +86,39 @@ static ssize_t my_tmpfs_read(struct file *filp, char __user *buf,
         len = avail;
 
     while (len > 0) {
-        page_idx = pos >> PAGE_SHIFT;
-        page_off = pos & (PAGE_SIZE - 1);
-        copy_len = min(len, PAGE_SIZE - page_off);
+        pgoff_t idx = pos >> PAGE_SHIFT;
+        size_t offset = pos & ~PAGE_MASK;
+        size_t copy_len = min(len, PAGE_SIZE - offset);
+        struct page *page;
+        char *kaddr;
 
-        if (!mf->pages || page_idx >= mf->max_pages || !mf->pages[page_idx]) {
-            if (clear_user(buf, copy_len))
-                return ret ? ret : -EFAULT;
+        page = my_tmpfs_get_page(inode, idx);
+        if (IS_ERR(page))
+            return PTR_ERR(page);
+
+        if (page == ZERO_PAGE(0)) {
+            if (clear_user(buf, copy_len)) {
+                if (ret == 0)
+                    ret = -EFAULT;
+                break;
+            }
         } else {
-            page = mf->pages[page_idx];
             kaddr = kmap(page);
-            if (!kaddr)
-                return ret ? ret : -ENOMEM;
-
-            if (copy_to_user(buf, kaddr + page_off, copy_len)) {
+            if (!kaddr) {
+                put_page(page);
+                if (ret == 0)
+                    ret = -ENOMEM;
+                break;
+            }
+            if (copy_to_user(buf, kaddr + offset, copy_len)) {
                 kunmap(page);
-                return ret ? ret : -EFAULT;
+                put_page(page);
+                if (ret == 0)
+                    ret = -EFAULT;
+                break;
             }
             kunmap(page);
+            put_page(page);
         }
 
         ret += copy_len;
@@ -73,6 +143,7 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     size_t ret = 0;
     struct page *page;
     char *kaddr;
+    pgoff_t first_page;
     size_t page_idx;
     size_t page_off;
     size_t copy_len;
@@ -89,6 +160,9 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
     } else {
         pos = *off;
     }
+
+    page_idx = pos >> PAGE_SHIFT;
+    first_page = page_idx;
 
     if (sbi->current_size + len > sbi->max_size)
         return -ENOSPC;
@@ -123,6 +197,8 @@ static ssize_t my_tmpfs_write(struct file *filp, const char __user *buf,
             mf->size = pos;
         }
     }
+
+    invalidate_inode_pages2_range(inode->i_mapping, first_page, page_idx);
 
     *off = pos;
     inode->i_size = mf->size;
@@ -198,6 +274,21 @@ int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
             sbi->current_size -= (unsigned long)(oldsize - newsize);
         else if (sbi)
             sbi->current_size = 0;
+        
+        for (i = start_page; i < ((oldsize + PAGE_SIZE - 1) >> PAGE_SHIFT); i++) {
+            if (!mf->pages || i >= (size_t)mf->max_pages)
+                continue;
+            if (!mf->pages[i])
+                continue;
+            __free_page(mf->pages[i]);
+            mf->pages[i] = NULL;
+            if (mf->nr_pages > 0)
+                mf->nr_pages--;
+        }
+
+        invalidate_inode_pages2_range(inode->i_mapping,
+                                      newsize >> PAGE_SHIFT,
+                                      ((oldsize + PAGE_SIZE - 1) >> PAGE_SHIFT));
     } else {
         old_tail = oldsize & (PAGE_SIZE - 1);
         if (mf->pages && old_tail) {
@@ -209,6 +300,9 @@ int my_tmpfs_truncate_inode(struct inode *inode, loff_t newsize)
                 memset(kaddr + old_tail, 0, min_t(size_t, PAGE_SIZE - old_tail,
                                                    newsize - oldsize));
                 kunmap(page);
+                invalidate_inode_pages2_range(inode->i_mapping,
+                                              oldsize >> PAGE_SHIFT,
+                                              oldsize >> PAGE_SHIFT);
             }
         }
     }

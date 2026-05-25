@@ -18,7 +18,7 @@ struct inode *my_tmpfs_get_inode(struct super_block *sb, umode_t mode)
     if (S_ISREG(mode)) {
         inode->i_op = &my_tmpfs_file_inode_ops;
         inode->i_fop = &my_tmpfs_file_ops;
-        inode->i_mapping->a_ops = &empty_aops;
+        inode->i_mapping->a_ops = &my_tmpfs_aops;
     } else if (S_ISLNK(mode)) {
         inode->i_op = &my_tmpfs_symlink_inode_ops;
         inode->i_mapping->a_ops = &empty_aops;
@@ -50,3 +50,8 @@ void my_tmpfs_free_inode(struct inode *inode)
     my_tmpfs_free_file(mf);
     inode->i_private = NULL;
 }
+
+const struct address_space_operations my_tmpfs_aops = {
+    .writepage = my_tmpfs_writepage, // 页面换出
+    .readpage = my_tmpfs_readpage, // 页面换入
+};

@@ -23,7 +23,6 @@ struct page *my_tmpfs_alloc_page(struct my_tmpfs_file *mf, int index)
         new_pages = krealloc(mf->pages, new_max * sizeof(struct page *), GFP_KERNEL);
         if (!new_pages)
             return NULL;
-
         mf->pages = new_pages;
         memset(mf->pages + mf->max_pages, 0,
                (new_max - mf->max_pages) * sizeof(struct page *));
@@ -45,9 +44,8 @@ struct page *my_tmpfs_alloc_page(struct my_tmpfs_file *mf, int index)
 /* 释放所有已分配的页，然后释放文件对象本身。 */
 void my_tmpfs_free_file(struct my_tmpfs_file *mf)
 {
-    struct my_tmpfs_dir_entry *entry;
-    struct my_tmpfs_dir_entry *tmp;
-    int i;
+    struct my_tmpfs_dir_entry *entry,*tmp;
+    unsigned long i;
 
     if (!mf)
         return;

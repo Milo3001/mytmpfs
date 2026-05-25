@@ -16,6 +16,7 @@
 #include <linux/highmem.h>
 #include <linux/uaccess.h>
 #include <linux/fcntl.h>
+#include <linux/xarray.h>
 
 #define MY_TMPFS_DEBUG 1
 
@@ -68,5 +69,11 @@ extern const struct file_operations my_tmpfs_file_ops;
 extern const struct super_operations my_tmpfs_sops;
 
 int my_tmpfs_fill_super(struct super_block *sb, void *data, int silent);
+
+// memory management
+extern const struct address_space_operations my_tmpfs_aops;
+
+int my_tmpfs_writepage(struct page *page, struct writeback_control *wbc);
+int my_tmpfs_readpage(struct file *file, struct page *page);
 
 #endif
