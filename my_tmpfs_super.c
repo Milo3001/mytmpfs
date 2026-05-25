@@ -66,7 +66,6 @@ int my_tmpfs_fill_super(struct super_block *sb, void *data, int silent)
 
     root_priv->is_dir = true;
     INIT_LIST_HEAD(&root_priv->children);
-    xa_init(&root_priv->swap_entries);   // 新增
     root_inode->i_private = root_priv;
     set_nlink(root_inode, 2);
 

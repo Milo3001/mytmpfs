@@ -47,7 +47,6 @@ struct my_tmpfs_file {
     char *symlink_target;
     struct list_head children;
     bool is_dir;
-    struct xarray swap_entries;
 };
 
 struct my_tmpfs_dir_entry {
